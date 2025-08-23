@@ -1,0 +1,160 @@
+stages:
+  - sast
+  - secret_scan
+  - iac_scan
+  - build
+  - image_scan
+  - deploy
+  - zap
+  - deploy-prod
+  
+
+variables:
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  IMAGE_NAME: "$ACR_LOGIN_SERVER/secure-python-app:$IMAGE_TAG"
+
+#  SAST: Bandit 
+sast_bandit:
+  stage: sast
+  image: python:3.11
+  script:
+    - pip install bandit
+    - bandit -r . -f json -o bandit_report.json || true
+  artifacts:
+    paths:
+      - bandit_report.json
+    when: always
+  allow_failure: true
+
+#  Secret Scanning: Gitleaks 
+secret_scan_gitleaks:
+  stage: secret_scan
+  image:
+    name: zricethezav/gitleaks
+    entrypoint: [""]
+  script:
+    - gitleaks detect --verbose --source . -f json -r gitleaks_report.json
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - gitleaks_report.json
+
+
+#  IaC Scan: checkov 
+iac_scan_checkov:
+  stage: iac_scan
+  image: 
+    name: bridgecrew/checkov:latest
+    entrypoint: [""]
+  script:
+    - checkov -d . --output-file-path checkov_report.json --output json || true
+  artifacts:
+    paths:
+      - checkov_report.json
+    when: always
+  allow_failure: true
+
+# Build and Push Image - 
+build:
+  stage: build
+  image: mcr.microsoft.com/azure-cli:2.53.1  # Use the Azure CLI image
+  services:
+    - docker:20.10.16-dind  # Docker-in-Docker service
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl jq bash docker python3 py3-pip  # Install Docker and Python3
+    - dockerd &  # Start the Docker daemon in the background
+    - sleep 5  # Wait for the Docker daemon to start
+    - az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+    - az account set --subscription $AZURE_SUBSCRIPTION_ID
+  script:
+    - az acr login --name $(echo $ACR_LOGIN_SERVER | cut -d'.' -f1) --expose-token | jq -r '.accessToken' | docker login $ACR_LOGIN_SERVER --username 00000000-0000-0000-0000-000000000000 --password-stdin
+    - docker build -t $IMAGE_NAME .  # Build the image with the unique tag
+    - docker push $IMAGE_NAME  # Push the image to ACR
+    - |
+      # Cleanup old images, keeping only the latest 2
+      az acr repository show-tags --name $(echo $ACR_LOGIN_SERVER | cut -d'.' -f1) --repository secure-python-app --orderby time_desc --output tsv | tail -n +3 | xargs -I {} az acr repository delete --name $(echo $ACR_LOGIN_SERVER | cut -d'.' -f1) --image secure-python-app:{} --yes
+
+
+#  Image Scan: Trivy 
+# Trivy needs build job to run, which already have the credentials cached, so this job works without logging in again:
+# before_script:
+#   - echo $AZURE_CLIENT_SECRET | docker login $ACR_LOGIN_SERVER --username $AZURE_CLIENT_ID --password-stdin
+image_scan_trivy:
+  stage: image_scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --exit-code 0 --format json --output trivy_report.json $IMAGE_NAME
+  artifacts:
+    paths:
+      - trivy_report.json
+    when: always
+  allow_failure: true
+  needs: ["build"]
+
+
+# Deploy 
+deploy:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli:2.53.1
+  before_script:
+    - apk add --no-cache curl bash
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    - az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+    - az account set --subscription $AZURE_SUBSCRIPTION_ID
+  script:
+    - az aks get-credentials --resource-group devsecops-rg --name secure-aks --overwrite-existing
+    - kubectl apply -f k8s/deployment.yaml
+    - kubectl apply -f k8s/service.yaml
+    - kubectl set image deployment/secure-python-app secure-python-app=$IMAGE_NAME # Update the deployment with the new image
+  needs: ["build"]
+
+
+#  DAST Scan: OWASP ZAP - Get the IP and then run the baseline scan
+get_app_ip:
+  stage: zap
+  image: mcr.microsoft.com/azure-cli:2.53.1
+  needs: ["deploy"]
+  script:
+    - az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+    - az account set --subscription $AZURE_SUBSCRIPTION_ID
+    - az aks get-credentials --resource-group devsecops-rg --name secure-aks --overwrite-existing
+    # Install kubectl
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    # Now get the app IP
+    - APP_IP=$(kubectl -n default get svc secure-python-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    - echo $APP_IP > app_ip.txt
+  artifacts:
+    paths:
+      - app_ip.txt
+    expire_in: 1 hour
+  allow_failure: false
+
+zap_baseline_dynamic:
+  stage: zap
+  image:
+    name: ictu/zap2docker-weekly
+    entrypoint: [""]
+  needs: ["get_app_ip"]
+  script:
+    - APP_IP=$(cat app_ip.txt)
+    - echo $APP_IP
+    - zap-baseline.py -t http://$APP_IP:80 -I -x baseline_report.xml || true
+  artifacts:
+    paths:
+      - baseline_report.xml
+    when: always
+  allow_failure: true
+
+deploy_prod:
+  stage: deploy-prod
+  script:
+    - echo "deploying to production environment"
+  when: manual

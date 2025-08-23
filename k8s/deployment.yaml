@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-python-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secure-python-app
+  template:
+    metadata:
+      labels:
+        app: secure-python-app
+    spec:
+      containers:
+        - name: secure-python-app
+          image: devsecopsacr2025.azurecr.io/secure-python-app:latest
+          ports:
+            - containerPort: 5000
+          securityContext:
+            runAsUser: 1001
+            runAsNonRoot: true
+
