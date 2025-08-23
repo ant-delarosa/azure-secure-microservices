@@ -60,20 +60,22 @@ jobs:
     needs: [sast_bandit, secret_scan_gitleaks, iac_scan_checkov]
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/login@v1
+      - name: Azure Login
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - uses: azure/docker-login@v1
-        with:
-          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
-          username: 00000000-0000-0000-0000-000000000000
-          password: ${{ secrets.ACR_ACCESS_TOKEN }}
+      - name: Docker Login to ACR
+        run: |
+          az acr login --name $(echo ${{ secrets.ACR_LOGIN_SERVER }} | cut -d'.' -f1)
       - run: docker build -t $IMAGE_NAME .
       - run: docker push $IMAGE_NAME
-      - run: |
-          az acr repository show-tags --name $(echo ${{ secrets.ACR_LOGIN_SERVER }} | cut -d'.' -f1) \
+      - name: Cleanup old images (keep latest 2)
+        run: |
+          az acr repository show-tags \
+            --name $(echo ${{ secrets.ACR_LOGIN_SERVER }} | cut -d'.' -f1) \
             --repository secure-python-app --orderby time_desc --output tsv | tail -n +3 \
-            | xargs -I {} az acr repository delete --name $(echo ${{ secrets.ACR_LOGIN_SERVER }} | cut -d'.' -f1) \
+            | xargs -I {} az acr repository delete \
+            --name $(echo ${{ secrets.ACR_LOGIN_SERVER }} | cut -d'.' -f1) \
             --image secure-python-app:{} --yes
 
   # Image Scan - Trivy
@@ -97,13 +99,17 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/login@v1
+      - name: Azure Login
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - run: |
+      - name: Install kubectl
+        run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
+      - name: Deploy to AKS
+        run: |
           az aks get-credentials --resource-group devsecops-rg --name secure-aks --overwrite-existing
           kubectl set image deployment/secure-python-app secure-python-app=$IMAGE_NAME
           kubectl apply -f k8s/service.yaml
@@ -113,14 +119,18 @@ jobs:
     runs-on: ubuntu-latest
     needs: deploy
     steps:
-      - uses: azure/login@v1
+      - name: Azure Login
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - run: |
-          az aks get-credentials --resource-group devsecops-rg --name secure-aks --overwrite-existing
+      - name: Install kubectl
+        run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
+      - name: Get Service IP
+        run: |
+          az aks get-credentials --resource-group devsecops-rg --name secure-aks --overwrite-existing
           APP_IP=$(kubectl -n default get svc secure-python-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           echo $APP_IP > app_ip.txt
       - uses: actions/upload-artifact@v4
@@ -144,7 +154,7 @@ jobs:
           name: zap-baseline-report
           path: baseline_report.xml
 
-  # Deploy to Production (manual approval)
+  # Deploy to Production (manual trigger)
   deploy_prod:
     runs-on: ubuntu-latest
     needs: zap_baseline_dynamic
