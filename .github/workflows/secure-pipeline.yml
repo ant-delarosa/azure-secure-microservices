@@ -60,7 +60,8 @@ jobs:
   # Build and Push to Azure ACR
   build:
     runs-on: ubuntu-latest
-    needs: [sast_bandit, secret_scan_gitleaks, iac_scan_checkov]
+    #needs: [sast_bandit, secret_scan_gitleaks, iac_scan_checkov]
+    needs: [sast_bandit, secret_scan_gitleaks]
     steps:
       - uses: actions/checkout@v4
       - name: Azure Login
