@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   pull_request:
 
+permissions:
+  contents: read   # restricts to read-only repo access
+
 env:
   IMAGE_TAG: ${{ github.sha }}
   IMAGE_NAME: ${{ secrets.ACR_LOGIN_SERVER }}/secure-python-app:${{ github.sha }}
