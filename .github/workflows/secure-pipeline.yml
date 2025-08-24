@@ -65,6 +65,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Logout previous Azure sessions
+        run: az logout
+
       - name: Azure Login (Service Principal)
         uses: azure/login@v2
         with:
